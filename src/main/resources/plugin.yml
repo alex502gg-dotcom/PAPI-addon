@@ -1,0 +1,11 @@
+name: PlayerReportsPAPI
+version: 1.0.0
+main: ru.playerreports.papi.PlayerReportsPAPIPlugin
+api-version: 1.13
+depend:
+  - PlaceholderAPI
+softdepend:
+  - PlayerReports
+authors:
+  - Codex
+description: PlaceholderAPI placeholders for PlayerReports report counters.

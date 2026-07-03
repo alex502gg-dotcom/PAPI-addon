@@ -1,0 +1,15 @@
+# Name of the reports plugin as it appears in /plugins.
+playerreports-plugin-name: "PlayerReports"
+
+# Placeholder identifier. Use %playerreports_reports% by default.
+placeholder-identifier: "playerreports"
+
+# Recalculate cached report count every N seconds.
+cache-seconds: 15
+
+# Fallback folder names inside plugins/PlayerReports that may contain report files.
+# The plugin counts .yml, .yaml and .json files when no API-like method is found.
+fallback-report-folders:
+  - "reports"
+  - "data"
+  - "database"
