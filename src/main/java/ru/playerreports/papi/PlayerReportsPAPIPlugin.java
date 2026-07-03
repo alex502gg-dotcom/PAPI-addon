@@ -3,7 +3,7 @@ package ru.playerreports.papi;
 import me.clip.placeholderapi.expansion.PlaceholderExpansion;
 import org.bukkit.Bukkit;
 import org.bukkit.OfflinePlayer;
-import org.bukkit.configuration.file.FileConfiguration;
+import org.bukkit.entity.Player;
 import org.bukkit.plugin.Plugin;
 import org.bukkit.plugin.java.JavaPlugin;
 
@@ -23,14 +23,15 @@ public final class PlayerReportsPAPIPlugin extends JavaPlugin {
         saveDefaultConfig();
 
         if (Bukkit.getPluginManager().getPlugin("PlaceholderAPI") == null) {
-            getLogger().severe("PlaceholderAPI not found. Disabling.");
+            getLogger().severe("PlaceholderAPI не найден.");
             Bukkit.getPluginManager().disablePlugin(this);
             return;
         }
 
         expansion = new ReportsExpansion(this);
         expansion.register();
-        getLogger().info("Registered PlaceholderAPI placeholders.");
+
+        getLogger().info("PlaceholderAPI expansion registered: %playerreports_reports%");
     }
 
     @Override
@@ -42,8 +43,9 @@ public final class PlayerReportsPAPIPlugin extends JavaPlugin {
 
     private static final class ReportsExpansion extends PlaceholderExpansion {
         private final PlayerReportsPAPIPlugin plugin;
-        private long nextRefreshAt;
+        private long nextUpdate;
         private int cachedCount;
+        private String lastStatus = "not-loaded";
 
         private ReportsExpansion(PlayerReportsPAPIPlugin plugin) {
             this.plugin = plugin;
@@ -71,179 +73,164 @@ public final class PlayerReportsPAPIPlugin extends JavaPlugin {
 
         @Override
         public String onRequest(OfflinePlayer player, String params) {
-            String key = params == null ? "" : params.toLowerCase(Locale.ROOT);
+            return handle(params);
+        }
+
+        @Override
+        public String onPlaceholderRequest(Player player, String params) {
+            return handle(params);
+        }
+
+        private String handle(String params) {
+            if (params == null) return "";
+
+            String key = params.toLowerCase(Locale.ROOT);
+
             if (key.equals("reports") || key.equals("open") || key.equals("total") || key.equals("count")) {
-                return Integer.toString(getReportCount());
+                return String.valueOf(getReportCount());
             }
+
+            if (key.equals("status")) {
+                getReportCount();
+                return lastStatus;
+            }
+
             return null;
         }
 
         private int getReportCount() {
             long now = System.currentTimeMillis();
-            if (now < nextRefreshAt) {
+            if (now < nextUpdate) {
                 return cachedCount;
             }
 
-            FileConfiguration config = plugin.getConfig();
-            long cacheMillis = Math.max(1L, config.getLong("cache-seconds", 15L)) * 1000L;
-            nextRefreshAt = now + cacheMillis;
+            long cacheSeconds = plugin.getConfig().getLong("cache-seconds", 15);
+            nextUpdate = now + Math.max(1, cacheSeconds) * 1000L;
+
             cachedCount = Math.max(0, resolveReportCount());
             return cachedCount;
         }
 
         private int resolveReportCount() {
-            Plugin reportsPlugin = Bukkit.getPluginManager().getPlugin(
-                    plugin.getConfig().getString("playerreports-plugin-name", "PlayerReports")
-            );
+            String pluginName = plugin.getConfig().getString("playerreports-plugin-name", "PlayerReports");
+            Plugin reportsPlugin = Bukkit.getPluginManager().getPlugin(pluginName);
 
-            if (reportsPlugin != null && reportsPlugin.isEnabled()) {
-                Integer reflected = tryReflectCount(reportsPlugin);
-                if (reflected != null) {
-                    return reflected;
-                }
+            if (reportsPlugin == null) {
+                lastStatus = "playerreports-plugin-not-found:" + pluginName;
+                return 0;
             }
 
-            return countFallbackFiles(reportsPlugin);
+            if (!reportsPlugin.isEnabled()) {
+                lastStatus = "playerreports-disabled";
+                return 0;
+            }
+
+            Integer reflected = tryFindCount(reportsPlugin, 0);
+            if (reflected != null) {
+                lastStatus = "ok:reflection";
+                return reflected;
+            }
+
+            int files = countFallbackFiles(reportsPlugin.getDataFolder());
+            lastStatus = "ok:file-fallback";
+            return files;
         }
 
-        private Integer tryReflectCount(Object target) {
-            Integer direct = tryCountFromMembers(target, 0);
-            if (direct != null) {
-                return direct;
-            }
+        private Integer tryFindCount(Object object, int depth) {
+            if (object == null || depth > 3) return null;
 
-            for (Method method : target.getClass().getMethods()) {
-                if (method.getParameterTypes().length != 0) {
-                    continue;
-                }
+            Integer direct = countValue(object, depth);
+            if (direct != null) return direct;
+
+            for (Method method : object.getClass().getMethods()) {
+                if (method.getParameterCount() != 0) continue;
 
                 String name = method.getName().toLowerCase(Locale.ROOT);
-                if (!name.contains("report") && !name.contains("complaint")) {
-                    continue;
-                }
+                if (!looksUseful(name)) continue;
 
                 try {
                     method.setAccessible(true);
-                    Object value = method.invoke(target);
-                    Integer count = countValue(value, 1);
-                    if (count != null) {
-                        return count;
-                    }
-                } catch (ReflectiveOperationException | RuntimeException ignored) {
-                    // Try the next possible PlayerReports implementation shape.
+                    Object result = method.invoke(object);
+                    Integer count = countValue(result, depth + 1);
+                    if (count != null) return count;
+
+                    Integer nested = tryFindCount(result, depth + 1);
+                    if (nested != null) return nested;
+                } catch (Throwable ignored) {
                 }
             }
 
-            return null;
-        }
-
-        private Integer tryCountFromMembers(Object target, int depth) {
-            if (target == null || depth > 2) {
-                return null;
-            }
-
-            for (Method method : target.getClass().getMethods()) {
-                if (method.getParameterTypes().length != 0) {
-                    continue;
-                }
-
-                String name = method.getName().toLowerCase(Locale.ROOT);
-                if (!looksLikeReportAccessor(name)) {
-                    continue;
-                }
-
-                try {
-                    method.setAccessible(true);
-                    Object value = method.invoke(target);
-                    Integer count = countValue(value, depth + 1);
-                    if (count != null) {
-                        return count;
-                    }
-                } catch (ReflectiveOperationException | RuntimeException ignored) {
-                    // Keep scanning.
-                }
-            }
-
-            for (Field field : target.getClass().getDeclaredFields()) {
+            for (Field field : object.getClass().getDeclaredFields()) {
                 String name = field.getName().toLowerCase(Locale.ROOT);
-                if (!looksLikeReportAccessor(name)) {
-                    continue;
-                }
+                if (!looksUseful(name)) continue;
 
                 try {
                     field.setAccessible(true);
-                    Integer count = countValue(field.get(target), depth + 1);
-                    if (count != null) {
-                        return count;
-                    }
-                } catch (ReflectiveOperationException | RuntimeException ignored) {
-                    // Keep scanning.
+                    Object result = field.get(object);
+                    Integer count = countValue(result, depth + 1);
+                    if (count != null) return count;
+
+                    Integer nested = tryFindCount(result, depth + 1);
+                    if (nested != null) return nested;
+                } catch (Throwable ignored) {
                 }
             }
 
             return null;
         }
 
-        private boolean looksLikeReportAccessor(String name) {
+        private boolean looksUseful(String name) {
             return name.contains("report")
                     || name.contains("complaint")
-                    || name.equals("getstorage")
-                    || name.equals("getdatabase")
-                    || name.equals("getmanager");
+                    || name.contains("storage")
+                    || name.contains("database")
+                    || name.contains("manager");
         }
 
         private Integer countValue(Object value, int depth) {
-            if (value == null) {
-                return null;
-            }
-            if (value instanceof Number) {
-                return ((Number) value).intValue();
-            }
+            if (value == null) return null;
+
             if (value instanceof Collection<?>) {
                 return ((Collection<?>) value).size();
             }
+
             if (value instanceof Map<?, ?>) {
                 return ((Map<?, ?>) value).size();
             }
+
             if (value.getClass().isArray()) {
                 return Array.getLength(value);
             }
-            return tryCountFromMembers(value, depth);
+
+            return null;
         }
 
-        private int countFallbackFiles(Plugin reportsPlugin) {
-            File dataFolder = reportsPlugin != null
-                    ? reportsPlugin.getDataFolder()
-                    : new File(plugin.getDataFolder().getParentFile(), plugin.getConfig().getString("playerreports-plugin-name", "PlayerReports"));
-
+        private int countFallbackFiles(File dataFolder) {
             int total = 0;
+
             for (String folderName : plugin.getConfig().getStringList("fallback-report-folders")) {
-                File folder = new File(dataFolder, folderName);
-                total += countReportFiles(folder);
+                total += countReportFiles(new File(dataFolder, folderName));
             }
+
             return total;
         }
 
         private int countReportFiles(File file) {
-            if (file == null || !file.exists()) {
-                return 0;
-            }
+            if (file == null || !file.exists()) return 0;
+
             if (file.isFile()) {
                 String name = file.getName().toLowerCase(Locale.ROOT);
-                return name.endsWith(".yml")
-                        || name.endsWith(".yaml")
-                        || name.endsWith(".json") ? 1 : 0;
+                return name.endsWith(".yml") || name.endsWith(".yaml") || name.endsWith(".json") ? 1 : 0;
             }
 
-            File[] children = file.listFiles();
-            if (children == null) {
-                return 0;
-            }
+            File[] files = file.listFiles();
+            if (files == null) return 0;
 
             int total = 0;
-            for (File child : children) {
+            for (File child : files) {
                 total += countReportFiles(child);
             }
+
             return total;
         }
     }
